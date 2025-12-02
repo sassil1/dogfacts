@@ -4,10 +4,236 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ilovedogs</title>
+    <title>Adoptable Pets — Maps</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+    <style>
+      body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+      .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+      h1 { margin: 8px 0 12px; font-size: 28px; }
+      h2 { margin: 20px 0 8px; font-size: 20px; }
+      p.lead { margin: 0 0 16px; color: #444; }
+      .map { height: 360px; width: 100%; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden; }
+      .note { font-size: 12px; color: #666; margin-top: 8px; }
+      #status { margin: 8px 0; color: #555; }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
+    <div class="wrap">
+      <h1>Adoptable Pets — Maps</h1>
+      <p class="lead">Heatmap of concentrations, nearest adoptable pets, and clustered intake/found locations.</p>
+      <div id="status"></div>
+
+      <h2>Heatmap: Concentrations</h2>
+      <div id="heatmap" class="map"></div>
+
+      <h2>Clustered: Intake/Found Locations</h2>
+      <div id="clustered" class="map"></div>
+
+      <h2>Nearest Adoptable Pets</h2>
+      <div id="nearest" class="map"></div>
+      <div class="note">Allow location access to see nearest pets. Geocoded results are cached locally for faster reloads.</div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+    <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+    <script>
+      const DATA_URL = 'https://data.montgomerycountymd.gov/resource/e54u-qx42.json?$limit=5000';
+      const DEFAULT_CENTER = [39.1547, -77.2405]; // Montgomery County, MD
+      const DEFAULT_ZOOM = 10;
+      const MAX_GEOCODE = 150; // cap client-side geocoding
+      const CACHE_KEY = 'geoCache_v1';
+
+      const $ = (id) => document.getElementById(id);
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const toRad = (d) => (d * Math.PI) / 180;
+      function haversineKm(a, b) {
+        const R = 6371;
+        const dLat = toRad(b[0] - a[0]);
+        const dLon = toRad(b[1] - a[1]);
+        const lat1 = toRad(a[0]);
+        const lat2 = toRad(b[0]);
+        const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+        return 2 * R * Math.asin(Math.sqrt(h));
+      }
+
+      function getCoordsFromRecord(rec) {
+        const candidates = ['intake_location', 'location', 'found_location'];
+        for (const k of candidates) {
+          const v = rec[k];
+          if (v && typeof v === 'object' && 'latitude' in v && 'longitude' in v) {
+            const lat = parseFloat(v.latitude);
+            const lng = parseFloat(v.longitude);
+            if (Number.isFinite(lat) && Number.isFinite(lng)) return [lat, lng];
+          }
+        }
+        return null;
+      }
+
+      function bestAddress(rec) {
+        return (
+          rec?.intake_location?.human_address ||
+          rec?.found_location?.human_address ||
+          rec?.intake_location ||
+          rec?.found_location ||
+          rec?.address ||
+          rec?.location_text ||
+          null
+        );
+      }
+
+      async function geocode(address) {
+        if (!address) return null;
+        try {
+          const cache = JSON.parse(localStorage.getItem(CACHE_KEY) || '{}');
+          if (cache[address]) return cache[address];
+          await sleep(1100); // be polite to Nominatim
+          const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=' + encodeURIComponent(address + ', Montgomery County, MD');
+          const res = await fetch(url, { headers: { 'Accept-Language': 'en' } });
+          if (!res.ok) return null;
+          const json = await res.json();
+          if (!json?.length) return null;
+          const lat = parseFloat(json[0].lat);
+          const lng = parseFloat(json[0].lon);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+          cache[address] = [lat, lng];
+          localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+          return [lat, lng];
+        } catch {
+          return null;
+        }
+      }
+
+      async function loadRecords() {
+        const res = await fetch(DATA_URL);
+        if (!res.ok) throw new Error('Failed to fetch dataset');
+        const data = await res.json();
+        return Array.isArray(data) ? data : [];
+      }
+
+      async function buildPoints(records) {
+        const out = [];
+        let geocoded = 0;
+        for (const rec of records) {
+          let coords = getCoordsFromRecord(rec);
+          if (!coords) {
+            const addrSource = bestAddress(rec);
+            if (addrSource && geocoded < MAX_GEOCODE) {
+              const addr =
+                typeof addrSource === 'string'
+                  ? addrSource
+                  : typeof addrSource === 'object' && addrSource.address
+                  ? [addrSource.address, addrSource.city, addrSource.state, addrSource.zip].filter(Boolean).join(' ')
+                  : null;
+              if (addr) {
+                const g = await geocode(addr);
+                if (g) {
+                  coords = g;
+                  geocoded += 1;
+                }
+              }
+            }
+          }
+          if (coords) {
+            const [lat, lng] = coords;
+            const photo = Array.isArray(rec.photo_links) ? rec.photo_links[0] : (rec.photo_links || rec.photo || rec.image);
+            out.push({
+              lat, lng,
+              name: rec.name || rec.animalid || 'Unknown',
+              species: rec.species || 'PET',
+              address:
+                typeof rec.intake_location === 'string'
+                  ? rec.intake_location
+                  : rec?.intake_location?.human_address || rec.found_location || '',
+              photo,
+            });
+          }
+        }
+        return out;
+      }
+
+      function fitMapToPoints(map, points) {
+        if (!points.length) {
+          map.setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+          return;
+        }
+        const bounds = L.latLngBounds(points.map(p => [p.lat, p.lng]));
+        map.fitBounds(bounds.pad(0.1));
+      }
+
+      function createTileLayer() {
+        return L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '&copy; OpenStreetMap',
+          maxZoom: 19,
+        });
+      }
+
+      function createHeatmap(points) {
+        const map = L.map('heatmap');
+        createTileLayer().addTo(map);
+        const heat = L.heatLayer(points.map(p => [p.lat, p.lng, 1]), { radius: 20, blur: 15, maxZoom: 17 });
+        heat.addTo(map);
+        fitMapToPoints(map, points);
+      }
+
+      function createClustered(points) {
+        const map = L.map('clustered');
+        createTileLayer().addTo(map);
+        const cluster = L.markerClusterGroup({ chunkedLoading: true });
+        points.forEach(p => {
+          const m = L.marker([p.lat, p.lng]);
+          const photoHtml = p.photo ? '<img src=\"' + p.photo + '\" alt=\"' + (p.name || '') + '\" style=\"width:100%;margin:6px 0\" />' : '';
+          m.bindPopup('<div style=\"max-width:240px\"><div style=\"font-weight:600\">' + p.name + ' (' + p.species + ')</div>' + photoHtml + '<div style=\"font-size:12px\">' + (p.address || '') + '</div></div>');
+          cluster.addLayer(m);
+        });
+        cluster.addTo(map);
+        fitMapToPoints(map, points);
+      }
+
+      function createNearest(points) {
+        const map = L.map('nearest');
+        createTileLayer().addTo(map);
+        if (!('geolocation' in navigator)) {
+          map.setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+          return;
+        }
+        navigator.geolocation.getCurrentPosition((pos) => {
+          const user = [pos.coords.latitude, pos.coords.longitude];
+          const withDist = points.map(p => ({ ...p, dist: haversineKm(user, [p.lat, p.lng]) })).sort((a,b) => a.dist - b.dist).slice(0, 25);
+          const userCircle = L.circleMarker(user, { radius: 8, color: '#1e88e5' }).addTo(map);
+          const group = L.featureGroup([userCircle]);
+          withDist.forEach(p => {
+            const m = L.marker([p.lat, p.lng]);
+            m.bindPopup('<div style=\"max-width:240px\"><div style=\"font-weight:600\">' + p.name + ' (' + p.species + ')</div><div style=\"font-size:12px\">' + (p.address || '') + '</div><div style=\"font-size:12px;margin-top:4px\">Distance: ' + p.dist.toFixed(1) + ' km</div></div>');
+            m.addTo(map);
+            group.addLayer(m);
+          });
+          map.fitBounds(group.getBounds().pad(0.1));
+        }, () => {
+          map.setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+        });
+      }
+
+      (async function init() {
+        try {
+          $('status').textContent = 'Loading adoptable pets…';
+          const records = await loadRecords();
+          $('status').textContent = 'Processing locations…';
+          const points = await buildPoints(records);
+          $('status').textContent = '';
+          if (!points.length) {
+            $('status').textContent = 'No mappable pets found yet. Try reloading in a minute.';
+          }
+          createHeatmap(points);
+          createClustered(points);
+          createNearest(points);
+        } catch (e) {
+          $('status').textContent = 'Failed to load data. Please try again later.';
+          console.error(e);
+        }
+      })();
+    </script>
   </body>
 </html>
